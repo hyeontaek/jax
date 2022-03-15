@@ -974,24 +974,42 @@ class Jax2TfLimitation(primitive_harness.Limitation):
 
     def custom_assert(tst, r_jax, r_tf, *, args, tol, err_msg):
 
-      def _reconstruct_operand(result, is_tf: bool):
+      def _reconstruct_operand(result):
         # Reconstructing operand as documented in numpy.linalg.svd (see
         # https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html)
         s, u, v = result
         U = u[..., :s.shape[-1]]
         V = v[..., :s.shape[-1], :]
         S = s[..., None, :]
-        return jnp.matmul(U * S, V), s.shape, u.shape, v.shape
+        # return jnp.matmul(U * S, V), s.shape, u.shape, v.shape
+        return jnp.matmul(U * S, V, precision=lax.Precision.HIGHEST), s.shape, u.shape, v.shape
 
       if compute_uv:
-        r_jax_reconstructed = _reconstruct_operand(r_jax, False)
-        r_tf_reconstructed = _reconstruct_operand(r_tf, True)
-        tst.assertAllClose(
-            r_jax_reconstructed,
-            r_tf_reconstructed,
-            atol=tol,
-            rtol=tol,
-            err_msg=err_msg)
+        r_jax_reconstructed = _reconstruct_operand(r_jax)
+        r_tf_reconstructed = _reconstruct_operand(r_tf)
+
+        r_jax_reconstructed_operand = r_jax_reconstructed[0]
+        r_tf_reconstructed_operand = r_tf_reconstructed[0]
+        r_jax_reconstructed_shapes = r_jax_reconstructed[1:]
+        r_tf_reconstructed_shapes = r_tf_reconstructed[1:]
+
+        # Computes backward error https://www.netlib.org/lapack/lug/node97.html
+        # and uses the maximum backward error if there are bactch dimensions.
+        # The backward error is bounded by some constant multiplies the machine
+        # precision.
+        relative_error_norm = jnp.linalg.norm(
+            r_jax_reconstructed_operand - r_tf_reconstructed_operand,
+            axis=(-2, -1))
+        backward_error = (relative_error_norm /
+                          jnp.linalg.norm(r_jax_reconstructed[0],
+                                          axis=(-2, -1)))
+        max_backward_error = jnp.amax(backward_error)
+
+        tst.assertTrue(max_backward_error < tol)
+
+        tst.assertAllClose(r_jax_reconstructed_shapes,
+                           r_tf_reconstructed_shapes, atol=tol, rtol=tol,
+                           err_msg=err_msg)
       else:
         tst.assertAllClose(r_jax, r_tf, atol=tol, rtol=tol, err_msg=err_msg)
 
@@ -1020,11 +1038,11 @@ class Jax2TfLimitation(primitive_harness.Limitation):
             devices=("cpu", "gpu"),
             modes=("eager", "graph", "compiled")),
         custom_numeric(
-            description="custom numeric comparison when compute_uv",
+            description="custom numeric comparison when compute_uv on CPU/GPU",
             custom_assert=custom_assert,
             devices=("cpu", "gpu"),
             modes=("eager", "graph", "compiled"),
-            enabled=(compute_uv == True))
+            enabled=(compute_uv == True)),
     ]
 
   @classmethod
